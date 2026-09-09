@@ -92,7 +92,7 @@ for device in /dev/sda /dev/sda[0-9]*; do
     printf 'mounted_device=%s\n' "$device"
     printf 'mounted_fstype=%s\n' "$fstype"
     printf 'mounted_options=%s\n' "$options"
-    printf 'mounted_root_entries=' 
+    printf 'mounted_root_entries='
     find "$mountpoint" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
         | sort | tr '\n' ','
     printf '\n'
