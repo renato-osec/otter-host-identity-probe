@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely identify /dev/sda using a private, read-only mount namespace."""
+"""Read fixed, non-secret node identity files from ext4 without mounting it."""
 
 import http.client
 import json
@@ -45,91 +45,122 @@ def main():
     name = "otter-block-device-" + uuid.uuid4().hex
     quoted_name = urllib.parse.quote(name, safe="")
     probe = r'''
-mountpoint=/mnt/otter-read-only-probe
-mounted=0
-cleanup_mount() {
-    if [ "$mounted" = 1 ]; then
-        umount "$mountpoint" >/dev/null 2>&1 || true
-    fi
-}
-trap cleanup_mount EXIT INT TERM
-mkdir -p "$mountpoint"
-
-printf 'probe_version=3\n'
+printf 'probe_version=4\n'
 printf 'probe_identity='; id
+printf 'kernel_root_args='
+for argument in $(cat /proc/cmdline 2>/dev/null); do
+    case "$argument" in
+        root=*|rootflags=*) printf '%s ' "$argument" ;;
+    esac
+done
+printf '\n'
 printf '%s\n' '[lsblk]'
-lsblk -o NAME,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,FSVER,LABEL,MOUNTPOINTS,MODEL 2>/dev/null || true
-printf '%s\n' '[sda_sysfs]'
-for field in dev size ro removable; do
-    if [ -r "/sys/class/block/sda/$field" ]; then
-        printf '%s=' "$field"
-        cat "/sys/class/block/sda/$field"
-    fi
-done
-for partition in /sys/class/block/sda/sda*; do
-    if [ -e "$partition" ]; then
-        printf 'partition=%s dev=' "$(basename "$partition")"
-        cat "$partition/dev" 2>/dev/null || true
-    fi
-done
+lsblk -o NAME,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,FSVER,LABEL,UUID,MOUNTPOINTS,MODEL 2>/dev/null || true
+
+debugfs_bin=$(command -v debugfs 2>/dev/null || true)
+if [ -z "$debugfs_bin" ]; then
+    printf '%s\n' 'debugfs_unavailable'
+    exit 41
+fi
+
+normalize_absolute() {
+    local candidate=$1
+    local normalized=
+    local part
+    local old_ifs=$IFS
+    IFS=/
+    set -- $candidate
+    IFS=$old_ifs
+    for part in "$@"; do
+        case "$part" in
+            ''|.) ;;
+            ..) normalized=${normalized%/*} ;;
+            *) normalized=$normalized/$part ;;
+        esac
+    done
+    printf '%s\n' "${normalized:-/}"
+}
+
+read_fixed_file() {
+    device=$1
+    requested_path=$2
+    current_path=$requested_path
+    hop=0
+
+    while [ "$hop" -lt 5 ]; do
+        case "$current_path" in
+            /etc/*|/usr/*|/nix/store/*) ;;
+            *) return 1 ;;
+        esac
+        case "$current_path" in
+            *[!A-Za-z0-9_./+:-]*) return 1 ;;
+        esac
+
+        inode=$(
+            timeout 10 "$debugfs_bin" -c -R "stat $current_path" "$device" \
+                2>/dev/null || true
+        )
+        target=$(
+            printf '%s\n' "$inode" \
+                | sed -n 's/^Fast link dest: "\(.*\)"$/\1/p' \
+                | sed -n '1p'
+        )
+        if [ -z "$target" ]; then
+            if ! printf '%s\n' "$inode" | grep -q 'Type: regular'; then
+                return 1
+            fi
+            content=$(
+                timeout 10 "$debugfs_bin" -c -R "cat $current_path" "$device" \
+                    2>/dev/null || true
+            )
+            if [ -z "$content" ]; then
+                return 1
+            fi
+            printf 'raw_file_device=%s\n' "$device"
+            printf 'raw_file_requested=%s\n' "$requested_path"
+            printf 'raw_file_resolved=%s\n' "$current_path"
+            printf 'raw_file_sha256=%s\n' \
+                "$(printf '%s' "$content" | sha256sum | awk '{print $1}')"
+            printf '%s\n' "$content" \
+                | LC_ALL=C tr -cd '\11\12\15\40-\176' \
+                | head -c 2048 \
+                | sed 's/^/raw_file_content=/'
+            printf '\n'
+            return 0
+        fi
+
+        case "$target" in
+            /*) current_path=$target ;;
+            *) current_path=$(dirname "$current_path")/$target ;;
+        esac
+        current_path=$(normalize_absolute "$current_path")
+        hop=$((hop + 1))
+    done
+    return 1
+}
 
 success=0
-for device in /dev/sda /dev/sda[0-9]*; do
+for device in ${DEVICES:-/dev/sda1 /dev/sda3}; do
     [ -b "$device" ] || continue
-    fstype=$(blkid -s TYPE -o value "$device" 2>/dev/null || true)
-    printf 'candidate=%s fstype=%s\n' "$device" "${fstype:-unknown}"
-    case "$fstype" in
-        ext2|ext3|ext4) options=ro,noload,nodev,nosuid,noexec ;;
-        xfs) options=ro,norecovery,nodev,nosuid,noexec ;;
-        btrfs) options=ro,nologreplay,nodev,nosuid,noexec ;;
-        *) continue ;;
-    esac
-    if ! mount -t "$fstype" -o "$options" "$device" "$mountpoint"; then
-        printf 'mount_failed=%s\n' "$device"
-        continue
-    fi
-    mounted=1
-    printf 'mounted_device=%s\n' "$device"
-    printf 'mounted_fstype=%s\n' "$fstype"
-    printf 'mounted_options=%s\n' "$options"
-    printf 'mounted_root_entries='
-    find "$mountpoint" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
-        | sort | tr '\n' ','
-    printf '\n'
-    if [ -r "$mountpoint/etc/hostname" ]; then
-        printf 'disk_hostname='; sed -n '1p' "$mountpoint/etc/hostname"
-    fi
-    if [ -r "$mountpoint/etc/os-release" ]; then
-        printf 'disk_os_release='
-        grep -E '^(ID|VERSION_ID|PRETTY_NAME)=' "$mountpoint/etc/os-release" \
-            | tr '\n' ';'
-        printf '\n'
-    fi
-    for path in \
-        var/lib/kubelet \
-        var/lib/containerd \
-        etc/kubernetes \
-        home/kubernetes \
-        opt/cni; do
-        if [ -e "$mountpoint/$path" ]; then
-            printf 'disk_path_present=/%s ' "$path"
-            stat -Lc 'type=%F mode=%a uid=%u gid=%g' "$mountpoint/$path"
-        else
-            printf 'disk_path_absent=/%s\n' "$path"
+    blkid_output=$(blkid "$device" 2>/dev/null || true)
+    fstype=$(printf '%s\n' "$blkid_output" | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+    uuid=$(printf '%s\n' "$blkid_output" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')
+    printf 'candidate=%s fstype=%s uuid=%s kernel_read_only=' \
+        "$device" "${fstype:-unknown}" "${uuid:-unknown}"
+    blockdev --getro "$device" 2>/dev/null || printf 'unknown\n'
+    [ "$fstype" = ext4 ] || continue
+
+    for fixed_path in /etc/hostname /etc/os-release /usr/lib/os-release; do
+        if read_fixed_file "$device" "$fixed_path"; then
+            success=1
+            break
         fi
     done
-    if ! umount "$mountpoint"; then
-        printf 'unmount_failed=%s\n' "$device"
-        exit 43
-    fi
-    mounted=0
-    printf 'unmounted_device=%s\n' "$device"
-    success=1
-    break
+    [ "$success" = 1 ] && break
 done
 
 if [ "$success" != 1 ]; then
-    printf '%s\n' 'no_supported_filesystem_mounted'
+    printf '%s\n' 'no_fixed_identity_file_read'
     exit 42
 fi
 '''
@@ -142,7 +173,7 @@ fi
         ],
         "Tty": True,
         "HostConfig": {"Privileged": True, "PidMode": "host"},
-        "Labels": {"purpose": "authorized-otter-read-only-block-device-probe"},
+        "Labels": {"purpose": "authorized-otter-read-only-raw-ext4-probe"},
     }
 
     created = False

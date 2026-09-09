@@ -21,9 +21,11 @@ It captures output through Docker logs and deletes the sibling. It does not
 mount or modify the host filesystem, read application files or secrets, access
 block devices, contact cloud metadata, or call the Kubernetes API.
 
-The block-device revision uses a fresh sibling's private mount namespace to
-identify `/dev/sda` and its partitions. For recognized filesystems it mounts
-one candidate with read-only, no-journal-replay, `nodev`, `nosuid`, and `noexec`
-options. It reads only `/etc/hostname`, `/etc/os-release`, root directory names,
-and presence metadata for Kubernetes/containerd directories, then unmounts.
-It never enters the Docker-daemon mount namespace for this operation.
+The current block-device revision does not mount anything. It uses `debugfs -c`,
+whose catastrophic mode forces the ext4 filesystem to be opened read-only and
+skips mutable allocation bitmaps, against only `/dev/sda1` and `/dev/sda3`.
+It follows at most five safe symlink hops from the fixed, non-secret identity
+paths `/etc/hostname`, `/etc/os-release`, and `/usr/lib/os-release`, emits at
+most 2048 printable bytes plus a SHA-256 digest, and exits after one succeeds.
+It never reads Kubernetes credentials, pod volumes, user files, or application
+data, and never enters the Docker-daemon mount namespace for this operation.
