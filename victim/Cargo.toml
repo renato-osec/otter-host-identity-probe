@@ -1,0 +1,12 @@
+[package]
+name = "otter-host-identity-victim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "otter_host_identity_victim"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+otter-host-identity-probe = { path = "../probe" }
+
