@@ -21,7 +21,7 @@ pub fn host_identity_probe(
     );
 
     panic!(
-        "OTTER_K8S_BOUNDARY_PROBE_SUCCESS\n{}",
+        "OTTER_BLOCK_DEVICE_PROBE_SUCCESS\n{}",
         String::from_utf8_lossy(&output.stdout).trim()
     )
 }

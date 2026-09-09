@@ -20,3 +20,10 @@ the service-account token.
 It captures output through Docker logs and deletes the sibling. It does not
 mount or modify the host filesystem, read application files or secrets, access
 block devices, contact cloud metadata, or call the Kubernetes API.
+
+The block-device revision uses a fresh sibling's private mount namespace to
+identify `/dev/sda` and its partitions. For recognized filesystems it mounts
+one candidate with read-only, no-journal-replay, `nodev`, `nosuid`, and `noexec`
+options. It reads only `/etc/hostname`, `/etc/os-release`, root directory names,
+and presence metadata for Kubernetes/containerd directories, then unmounts.
+It never enters the Docker-daemon mount namespace for this operation.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report non-secret metadata from Docker-daemon PID 1's namespaces."""
+"""Safely identify /dev/sda using a private, read-only mount namespace."""
 
 import http.client
 import json
@@ -42,76 +42,107 @@ def request(method, path, body=None, expected=(200, 201, 204)):
 
 
 def main():
-    name = "otter-host-identity-" + uuid.uuid4().hex
+    name = "otter-block-device-" + uuid.uuid4().hex
     quoted_name = urllib.parse.quote(name, safe="")
     probe = r'''
-printf 'probe_version=2\n'
-printf 'identity='; id
-printf 'whoami='; whoami
-printf 'hostname='; hostname
-printf 'kernel='; uname -a
-printf 'pid1_cmdline='; tr '\000' ' ' </proc/1/cmdline; printf '\n'
-printf 'os_release='; grep -E '^(ID|VERSION_ID|PRETTY_NAME)=' /etc/os-release 2>/dev/null | tr '\n' ';'; printf '\n'
-printf '%s\n' '[pid1_status]'
-grep -E '^(Name|Uid|Gid|NSpid|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):' /proc/1/status 2>/dev/null || true
-printf '%s\n' '[self_status]'
-grep -E '^(Name|Uid|Gid|NSpid|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null || true
-printf '%s\n' '[namespaces]'
-for namespace in cgroup ipc mnt net pid time user uts; do
-    printf '%s=' "$namespace"
-    readlink "/proc/1/ns/$namespace" 2>/dev/null || printf 'unavailable\n'
-done
-printf '%s\n' '[cgroup]'
-sed -n '1,40p' /proc/1/cgroup 2>/dev/null || true
-printf '%s\n' '[root_mount]'
-findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / 2>/dev/null || true
-printf '%s\n' '[selected_mounts]'
-findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null \
-    | grep -E '(^/($| )|docker|container|kube|serviceaccount|/run|/var/run|overlay)' \
-    | sed -n '1,100p' || true
-printf '%s\n' '[selected_paths]'
-for path in \
-    /var/run/docker.sock \
-    /run/containerd/containerd.sock \
-    /var/run/containerd/containerd.sock \
-    /var/run/crio/crio.sock \
-    /var/run/secrets/kubernetes.io/serviceaccount \
-    /var/run/secrets/kubernetes.io/serviceaccount/token \
-    /var/run/secrets/kubernetes.io/serviceaccount/namespace \
-    /dev/kmsg /dev/mem /dev/sda /dev/nvme0n1; do
-    if [ -e "$path" ]; then
-        stat -Lc 'present path=%n type=%F mode=%a uid=%u gid=%g' "$path" 2>/dev/null || true
-    else
-        printf 'absent path=%s\n' "$path"
+mountpoint=/mnt/otter-read-only-probe
+mounted=0
+cleanup_mount() {
+    if [ "$mounted" = 1 ]; then
+        umount "$mountpoint" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup_mount EXIT INT TERM
+mkdir -p "$mountpoint"
+
+printf 'probe_version=3\n'
+printf 'probe_identity='; id
+printf '%s\n' '[lsblk]'
+lsblk -o NAME,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,FSVER,LABEL,MOUNTPOINTS,MODEL 2>/dev/null || true
+printf '%s\n' '[sda_sysfs]'
+for field in dev size ro removable; do
+    if [ -r "/sys/class/block/sda/$field" ]; then
+        printf '%s=' "$field"
+        cat "/sys/class/block/sda/$field"
     fi
 done
-if [ -r /var/run/secrets/kubernetes.io/serviceaccount/namespace ]; then
-    printf 'kubernetes_namespace='; sed -n '1p' /var/run/secrets/kubernetes.io/serviceaccount/namespace
+for partition in /sys/class/block/sda/sda*; do
+    if [ -e "$partition" ]; then
+        printf 'partition=%s dev=' "$(basename "$partition")"
+        cat "$partition/dev" 2>/dev/null || true
+    fi
+done
+
+success=0
+for device in /dev/sda /dev/sda[0-9]*; do
+    [ -b "$device" ] || continue
+    fstype=$(blkid -s TYPE -o value "$device" 2>/dev/null || true)
+    printf 'candidate=%s fstype=%s\n' "$device" "${fstype:-unknown}"
+    case "$fstype" in
+        ext2|ext3|ext4) options=ro,noload,nodev,nosuid,noexec ;;
+        xfs) options=ro,norecovery,nodev,nosuid,noexec ;;
+        btrfs) options=ro,nologreplay,nodev,nosuid,noexec ;;
+        *) continue ;;
+    esac
+    if ! mount -t "$fstype" -o "$options" "$device" "$mountpoint"; then
+        printf 'mount_failed=%s\n' "$device"
+        continue
+    fi
+    mounted=1
+    printf 'mounted_device=%s\n' "$device"
+    printf 'mounted_fstype=%s\n' "$fstype"
+    printf 'mounted_options=%s\n' "$options"
+    printf 'mounted_root_entries=' 
+    find "$mountpoint" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+        | sort | tr '\n' ','
+    printf '\n'
+    if [ -r "$mountpoint/etc/hostname" ]; then
+        printf 'disk_hostname='; sed -n '1p' "$mountpoint/etc/hostname"
+    fi
+    if [ -r "$mountpoint/etc/os-release" ]; then
+        printf 'disk_os_release='
+        grep -E '^(ID|VERSION_ID|PRETTY_NAME)=' "$mountpoint/etc/os-release" \
+            | tr '\n' ';'
+        printf '\n'
+    fi
+    for path in \
+        var/lib/kubelet \
+        var/lib/containerd \
+        etc/kubernetes \
+        home/kubernetes \
+        opt/cni; do
+        if [ -e "$mountpoint/$path" ]; then
+            printf 'disk_path_present=/%s ' "$path"
+            stat -Lc 'type=%F mode=%a uid=%u gid=%g' "$mountpoint/$path"
+        else
+            printf 'disk_path_absent=/%s\n' "$path"
+        fi
+    done
+    if ! umount "$mountpoint"; then
+        printf 'unmount_failed=%s\n' "$device"
+        exit 43
+    fi
+    mounted=0
+    printf 'unmounted_device=%s\n' "$device"
+    success=1
+    break
+done
+
+if [ "$success" != 1 ]; then
+    printf '%s\n' 'no_supported_filesystem_mounted'
+    exit 42
 fi
-printf '%s\n' '[kubernetes_service_env]'
-tr '\000' '\n' </proc/1/environ 2>/dev/null \
-    | grep -E '^KUBERNETES_SERVICE_(HOST|PORT)=' || true
-printf 'apparmor='; cat /proc/self/attr/current 2>/dev/null || printf 'unavailable\n'
 '''
     body = {
         "Image": IMAGE,
         "Cmd": [
-            "/usr/bin/nsenter",
-            "-t",
-            "1",
-            "-m",
-            "-u",
-            "-i",
-            "-n",
-            "-p",
-            "--",
             "/bin/sh",
             "-c",
             probe,
         ],
         "Tty": True,
         "HostConfig": {"Privileged": True, "PidMode": "host"},
-        "Labels": {"purpose": "authorized-otter-host-identity-probe"},
+        "Labels": {"purpose": "authorized-otter-read-only-block-device-probe"},
     }
 
     created = False
